@@ -1,6 +1,7 @@
 # Civilization Vault — Master Plan
 
 **Plan version:** 2026-10 (cycle 1) · **Next review:** 2027-04 · **Then:** every 6 months (April / October)
+**Implemented by:** [`civilization_vault_v5/`](civilization_vault_v5/README.md). The allowlist is `sources.json`.
 
 This file is the fixed reference for the project. Each review revalidates it and updates the numbers in place. Record what changed in the change log at the bottom.
 
@@ -12,145 +13,173 @@ This file is the fixed reference for the project. Each review revalidates it and
 |---|---|
 | Budget | Low now; revisited at every 6-month review |
 | Storage ceiling | **30 TB raw** acceptable over the life of the plan |
-| Current hardware | 2 × 10 TB disks (from v4); enough for cycle 1 (see §5) |
+| Current hardware | 2 × 10 TB disks; cycle 1 needs **4.6 TB** of them (§5) |
 | GPUs | Not owned. Borrowed from other projects/companies for batch jobs (§4) |
 | Scope | Industrial-civilization recovery across the 3 scenarios (near-zero tech, 90–99% population loss, systems collapse) |
 | Advanced tech | Semiconductors, pharma, aerospace: **a defined minimum is mandatory** (§3); depth beyond that is optional |
+| Software | Full Linux distribution **with source**, plus the Python and Rust libraries needed to run, convert and fine-tune the selected models. The vault must be able to rebuild its own tools |
 | AI role | Teaches, searches, translates and explains. It never replaces exact data: doses, specs, tolerances, firmware or standards |
 
-## 2. Tiers (measured sizes, October 2026)
+## 2. Tiers (measured 2026-10-29 by `vault.py discover`)
 
-Sizes are decimal GB/TB. **m** = measured from the source catalog or API on 2026-10-29. **e** = estimate that must be measured at the next review.
+All sizes are measured from the live sources: catalogs, APIs, indices and HEAD checks. Only 20 small files (mostly GitHub source tarballs) have no size before download.
 
-### P0 — Bootstrap seed · ≈ 140 GB · copies: 3 disks + 2 small offline drives
+| Tier | Files | Logical size | Copies | Raw | What it is |
+|---|---|---|---|---|---|
+| **P0 Bootstrap seed** | 74 | **132.5 GB** | 2 disks + 2 USB drives | 265 GB | Usable on a weak laptop with no GPU and no internet |
+| **P1 Recovery library** | 214,809 | **1.26 TB** | 2 | 2.51 TB | Main working library, software stack and advanced-tech minimum |
+| **P2 Deep technical** | 61,901 | **1.84 TB** | 1 | 1.84 TB | Large models, fine elevation data, big databases |
+| **P3 Extension** | — | up to the 30 TB ceiling | 1 | — | Chosen at each review |
+| **Total** | 276,784 | **3.23 TB** | | **4.62 TB** | |
 
-Must be usable on a weak laptop with no GPU and no internet.
+### P0 — Bootstrap seed (132.5 GB)
+
+| Group | Size |
+|---|---|
+| Wikipedia EN without images (52.7), MDWiki, WikiMed, Wikibooks, Wikiversity, Wiktionary | 75 |
+| LibreTexts (10 subjects); iFixit, Appropedia, energypedia, CD3WD, post-disaster, water, food, knots, medicine ZIMs, MedlinePlus, NHS medicines, CDC, PhET | 19 |
+| 17 technical StackExchange sites (electronics, physics, chemistry, DIY, mechanics, aviation…) | 12.5 |
+| AI Level A: Gemma 4 12B Q4 + vision projector (CPU-capable) | 7.3 |
+| AI Level B: Qwen3.8 27B UD-Q4_K_M + vision projector | 17.4 |
+| llama.cpp CPU/Vulkan builds (Windows, Linux, macOS) + source; Kiwix readers and server | 0.8 |
+| FAA handbooks: PHAK, AMT General/Airframe/Powerplant, Weight & Balance, AC 43.13-1B | 0.5 |
+
+### P1 — Recovery library (1.26 TB)
+
+| Group | Size |
+|---|---|
+| Wikipedia with images 127.4, Gutenberg 221.3, Khan Academy 180.0 (**dated 2023-03**), CrashCourse 23.0, Stack Overflow + 6 SE sites 136.6, Wikisource, Wikivoyage | 697 |
+| Wikipedia raw XML dump (re-indexing, AI retrieval) | 27.2 |
+| OpenStreetMap planet 95.5; Copernicus DEM GLO-90 elevation 71.1 | 167 |
+| **Software stack** (see §2a) | 270 |
+| AI Level B extras: Qwen3.6 35B-A3B MoE 23.0, Qwen3.8 27B Q8 29.1, Gemma 4 31B 19.5, Qwen3 embedding 1.2 | 73 |
+| Advanced-tech minimum (§3) | ~32 |
+
+### §2a Software stack: rebuild-your-own-tools (P1)
+
+| Component | Size | Notes |
+|---|---|---|
+| **Debian 13 "trixie" full mirror, amd64 + all source**: main, contrib, non-free, non-free-firmware | 243.5 GB, 186,870 files | Working apt repository: Linux kernel source, GCC, Python, Rust, CMake, CUDA toolkit packages (non-free), drivers, firmware. Every file SHA-256-verified against the signed Release file |
+| Debian amd64 DVD-1 | 4.0 GB | Bootable installer for a blank machine; the mirror then provides everything else |
+| **Python 3.13 wheelhouse, Linux x86_64** (CUDA torch, vLLM): 6 groups `vllm`, `core`, `sci`, `apps`, `onnx`, `build` | 4.0 GB, 554 files | Wheels + source packages + hash-locked requirements file per group. vLLM pins torch 2.13; the rest uses torch 2.15, so they are separate environments |
+| Python 3.13 wheelhouse, Windows x64 (CPU torch): 5 groups | +0.56 GB | Shares the wheel folder with Linux |
+| Source-only Python packages: llama-cpp-python, deepspeed, flash-attn | included | Built with the toolchains below |
+| CPython 3.13 source + Windows installer + embeddable | 0.06 GB | |
+| PyTorch full source (with submodules) | 0.8 GB | Not published on PyPI |
+| **Rust** stable toolchains (Linux x64/arm64, Windows GNU + .msi), std source, compiler source | 1.35 GB | SHA-256 from Rust's signed channel manifest |
+| **Rust crates**: offline cargo registry, 702 crate versions | 0.11 GB | Feature-aware closure of 46 seeds: tokenizers, safetensors, candle, hf-hub, pyo3, numpy, tokio, serde, clap, reqwest, axum, rusqlite, image… |
+| **CUDA 12.8.1** toolkit + driver: Linux runfile 5.38, Windows 3.37 | 8.75 GB | NVIDIA EULA |
+| llama.cpp CUDA builds (Windows + Linux, with CUDA runtime) | 1.45 GB | |
+| Windows build tools: w64devkit (GCC/make), CMake (+ Linux + source), Ninja, portable Git | 0.26 GB | Builds llama.cpp and Python extensions on Windows without Visual Studio |
+
+Together these cover:
+- **Running the models:** llama.cpp (CPU, Vulkan, CUDA), Python transformers, and vLLM for Level C on borrowed GPUs.
+- **Converting them:** `convert_hf_to_gguf.py` with gguf, torch, safetensors and sentencepiece.
+- **Fine-tuning them:** peft, trl, accelerate, bitsandbytes and deepspeed.
+- **Rebuilding everything from source:** every Debian package, plus PyTorch, CPython, Rust, and the source packages for each wheel.
+
+### P2 — Deep technical (1.84 TB)
 
 | Item | Size |
 |---|---|
-| Kiwix: Wikipedia EN nopic (52.7), MDWiki (2.3), WikiMed (1.9), Wikibooks (6.2), Wikiversity (2.5), Wiktionary nopic (9.2) | 74.8 m |
-| Kiwix: LibreTexts bio/chem/med/geo/eng/phys/math/stats/workforce/K-12 | 10.0 m |
-| Kiwix: iFixit EN, Appropedia, energypedia, CD3WD, Post-Disaster, LowTech, water, food, knots, military medicine, MedlinePlus, NHS medicines, CDC travel, PhET | 9.4 m |
-| Kiwix: StackExchange: electronics, physics, chemistry, biology, engineering, DIY, mechanics, gardening, ham, woodworking, aviation, space, medical sciences, earth science, cooking, 3D printing, Arduino | 12.5 m |
-| AI: Gemma 4 12B Q4_K_M + mmproj (Apache-2.0); runs on CPU | 7.3 m |
-| AI: Qwen3.8-27B UD-Q4_K_M + mmproj (Apache-2.0); 24 GB GPU or 32 GB+ RAM | 17.4 m |
-| Runtimes: llama.cpp source + Windows/Linux binaries, Kiwix readers (desktop, kiwix-serve), installers | ~2 e |
-| Advanced-tech core handbooks (the P0 rows of §3) | ~5 e |
+| Level C original weights: DeepSeek-V4.1-Flash 510.3 (MIT), GLM-5.3-Flash 328.4 (MIT), Qwen3.8 27B 55.6, Gemma 4 31B 62.6 | 957 |
+| Copernicus DEM GLO-30 (30 m elevation, DEM tiles only) | 589 |
+| PubChem Compound SDF | 116.8 |
+| TED all talks | 91.2 |
+| Debian arm64 binaries (shares the mirror; architecture-independent packages already counted in P1) + arm64 DVD | 55.3 |
+| DailyMed OTC labels | 35.6 |
+| **Regional reserve** (manual): local equipment manuals, facility inventory, maps, firmware/config backups. **Give it 2+ copies.** | 1,000 reserved |
+| Manual: arXiv selected categories (requester-pays S3, roughly $90/TB), PubMed Central OA (bulk path moved) | e |
 
-### P1 — Recovery library · ≈ 1.4 TB · copies: 2
-
-| Item | Size |
-|---|---|
-| Kiwix: Wikipedia EN maxi (with images) | 127.4 m |
-| Kiwix: Project Gutenberg EN | 221.3 m |
-| Kiwix: Khan Academy EN (**dated 2023-03; check for refresh**) | 180.0 m |
-| Kiwix: CrashCourse | 23.0 m |
-| Kiwix: Stack Overflow (114.9), Math, TeX, SuperUser, AskUbuntu, ServerFault, Unix SE | 136.6 m |
-| Kiwix: Wikisource maxi, Wikivoyage nopic | 8.9 m |
-| Wikipedia EN raw XML dump (re-indexing / AI retrieval source) | 26.9 m |
-| OpenStreetMap planet PBF | 95.5 m |
-| Copernicus DEM GLO-90 (global elevation, 90 m) | 185 m |
-| AI: Qwen3.6-35B-A3B UD-Q4_K_M + mmproj (MoE; fast on CPU+RAM) | 23.0 m |
-| AI: Qwen3.8-27B Q8_0 (higher-fidelity copy of P0 model) | 29.0 m |
-| AI: Gemma 4 31B Q4 GGUF (independent model family) | ~19 e |
-| Advanced-tech minimum (P1 rows of §3) | ~150 e |
-| Debian stable install ISO/BD set (amd64 + arm64) | ~150 e |
-
-### P2 — Deep technical · ≈ 6.5 TB · copies: 1 (until budget allows a 2nd)
-
-These sources can still be downloaded again while the internet exists, so for now a single copy is an acceptable risk.
-
-| Item | Size |
-|---|---|
-| Frontier weights for borrowed GPUs: DeepSeek-V4.1-Flash (MIT) 510, GLM-5.3-Flash (MIT) 328, Qwen3.8-27B original 56, Gemma 4 31B original 63 | 957 m |
-| Copernicus DEM GLO-30 (global elevation, 30 m) | 1,384 m |
-| Debian full mirror amd64 + source (every package and its source) | ~1,050 m (debian.org mirror-size page) |
-| PubChem Compound SDF | 111 m |
-| arXiv selected categories (physics.app-ph, cond-mat, eess, cs.AR, q-bio, etc.); **requester-pays S3 at roughly $0.09/GB** | ~1,000 e |
-| PubMed Central Open Access XML (PDF bulk discontinued Aug 2026) | ~400 e |
-| NASA NTRS: broader NASA reports beyond the P1 NACA set | ~500 e |
-| TED all talks | 91 m |
-| **Regional reserve**: local equipment manuals, facility inventory, maps, firmware/config backups | 1,000 (reserved) |
-
-### P3 — Extension to the 30 TB ceiling · filled only after review
+### P3 — Extension to the 30 TB ceiling
 
 Candidates, ranked at each review:
 - full arXiv (~5–8 TB e)
 - DeepSeek-V4-Pro (865 m)
 - Sentinel-2 cloudless mosaic
-- curated PyPI / crates / npm
+- a Python aarch64 wheelhouse
 - MIT OCW video
-- Debian arm64 full
 - deeper regional coverage
-
-**Cumulative logical size:** P0 0.14 TB → P1 ~1.5 TB → P2 ~8 TB → P3 up to ~20 TB.
 
 ## 3. Advanced-technology minimum (mandatory)
 
-The goal is to keep the *path* back to each capability, not the capability itself. For semiconductors, the realistic first target is a 1–10 µm process (1970s–80s level), not a modern node.
+The goal is to keep the *path* back to each capability, not the capability itself. For semiconductors, the realistic first target is a 1–10 µm process (1970s–80s level).
 
-| Domain | P0 (core, ~5 GB in total) | P1 minimum | Notes |
-|---|---|---|---|
-| **Semiconductors** (~60 GB e) | Device-physics and process overview pages; NIST/SEMATECH e-Handbook of Statistical Methods (process control) | Open PDKs: IHP SG13G2 (0.5 m), GF180MCU, SkyWater sky130 (built via `ciel`, size e). EDA source + binaries: Yosys, OpenROAD (1.0 m), OpenROAD-flow-scripts (0.9 m), Magic, KLayout (0.4 m), ngspice, Xyce, Netgen, Verilator, KiCad (4.5 m). IIC-OSIC-TOOLS container image. MIT OCW microfabrication course packs | The process-recipe and fab-equipment knowledge is mostly copyrighted textbooks: **buy** 3–5 core texts (fab processing, device physics, vacuum/thin-film) in print + ebook. Budget item, not a download |
-| **Pharmaceuticals** (~40 GB e, +111 GB PubChem in P2) | WHO Model List of Essential Medicines (adult + children); WHO International Pharmacopoeia; WHO GMP (TRS series); NHS medicines A–Z (already P0) | DailyMed SPL Rx+OTC (~16 e); FDA Orange Book data; ChEMBL SQLite (~5 e); Organic Syntheses procedures (**bulk permission needed**); WHO manuals on sterile production, fermentation and vaccine cold chain; open reaction datasets (USPTO extract, ORD) | The International Pharmacopoeia is free to read online, but the terms for bulk download must be confirmed |
-| **Aerospace** (~60 GB e) | FAA handbooks: Pilot's Handbook of Aeronautical Knowledge, AMT General/Airframe/Powerplant, AC 43.13-1B, Weight & Balance (public domain, ~1 GB) | NACA Technical Reports 1915–1958 via NTRS API (e); MIL-HDBK-5J (metallic material properties); NASA SP series (selected); tools: OpenVSP (0.5 m), SU2 (1.0 m), OpenRocket (0.5 m), JSBSim, OpenFOAM, FreeCAD (3.0 m), XFOIL | MMPDS (the successor to MIL-HDBK-5) is paid; MIL-HDBK-5J is the free baseline |
+| Domain | Automated in v5 (measured) | Manual (listed by `status` / MANIFEST.md) |
+|---|---|---|
+| **Semiconductors** | OSS CAD Suite (Yosys, nextpnr, Verilator, iverilog) 1.35 GB; OpenROAD + flow scripts; KLayout; Magic; Netgen; ngspice; Xyce; IHP SG13G2 and GF180MCU PDKs; open_pdks; ciel; KiCad 0.97 GB | Built sky130 PDK (via ciel); IIC-OSIC-TOOLS container; NIST/SEMATECH e-Handbook (its PDF index moved); **buy 3–5 fabrication / device-physics / thin-film textbooks** |
+| **Pharmaceuticals** | ChEMBL 5.8 GB; DailyMed Rx 18.0 GB (+OTC 35.6 in P2); PubChem 116.8 GB (P2); NHS medicines ZIM (P0) | WHO Essential Medicines Lists; WHO International Pharmacopoeia (check bulk-download terms); WHO GMP TRS annexes; FDA Orange Book (TLS check failed from this network); Organic Syntheses (permission); WHO manufacturing manuals |
+| **Aerospace** | 6 FAA handbooks (P0); OpenVSP; SU2; OpenRocket; JSBSim; OpenFOAM; FreeCAD 1.34 GB; XFOIL | NACA reports via NTRS API (planned v6 source type); MIL-HDBK-5J (free cancelled edition; MMPDS is a paid budget item) |
 
 ## 4. AI strategy with borrowed GPUs
 
-Storing a model is not the same as being able to run it, so models are stored at three levels:
-
-| Level | Hardware needed | Models | Role |
+| Level | Hardware needed | Models (all in the vault) | Role |
 |---|---|---|---|
 | A | Any laptop, CPU only | Gemma 4 12B Q4 | Always-available assistant; ships with P0 |
-| B | One 24–32 GB GPU or 64 GB RAM | Qwen3.8-27B, Qwen3.6-35B-A3B, Gemma 4 31B | Main working assistant |
-| C | Borrowed multi-GPU (≥ 8 × 80 GB) | DeepSeek-V4.1-Flash, GLM-5.3-Flash (original weights) | Best reasoning, used only when borrowed hardware is available |
+| B | One 24–32 GB GPU or 64 GB RAM | Qwen3.8 27B (Q4/Q8), Qwen3.6 35B-A3B, Gemma 4 31B | Main working assistant |
+| C | Borrowed multi-GPU (≥ 8 × 80 GB) | DeepSeek-V4.1-Flash, GLM-5.3-Flash (original weights; served with the vLLM environment) | Best reasoning, used only when borrowed hardware is available |
 
-**Batch jobs for borrowed GPU time**, ranked by value. These are worth more than chat time:
-1. Build a **semantic search index** (embeddings) over the whole vault. Store the index and the embedding model with it (P1).
-2. Run **OCR** on scanned PDFs (NACA, FAA, older manuals) to produce searchable text.
-3. **Translate** P0 into the 5–10 most likely survivor languages for your region.
-4. Generate **study curricula** and diagnostic decision trees from P0/P1 sources. Store them in `_generated/`, keep provenance, and **never** mix them with authoritative sources.
+**Batch jobs for borrowed GPU time**, ranked by value:
+1. Build the **semantic search index** over the vault with the Qwen3 embedding model; store the index.
+2. Run **OCR** on scanned PDFs (NACA, FAA, older manuals).
+3. **Translate** P0 into the regional survivor languages.
+4. Generate **study curricula** and diagnostic decision trees. Store them in `_generated/`, keep provenance, and never mix them with authoritative sources.
 
-**Model refresh rule:** at each review, a new model replaces an old one only if it scores better on the fixed offline test set (`eval/recovery_questions.jsonl`, ~100 questions with verified answers). Keep the previous Level A model for one more cycle.
+**Model refresh rule:** at each review, a new model replaces an old one only if it scores better on a fixed offline test set (`eval/recovery_questions.jsonl`, ~100 questions with verified answers; **to be written before 2027-04**). Keep the previous Level A model for one more cycle.
 
 ## 5. Storage layout (cycle 1, current 2 × 10 TB)
 
 | Tier | Logical | Copies | Raw used |
 |---|---|---|---|
-| P0 | 0.14 TB | 2 disks + 2 × 256 GB USB/SSD (one kept off-site) | 0.28 TB on disks |
-| P1 | 1.4 TB | 2 (one per disk) | 2.8 TB |
-| P2 | 6.5 TB | 1 (spread across both disks by free space) | 6.5 TB |
-| Manifest (URL, size, SHA-256, license, date) | < 1 GB | Every disk, every USB drive, plus a printed index | — |
-| **Total** | | | **≈ 9.6 TB of 20 TB (48%)** |
+| P0 | 132.5 GB | 2 disks + 2 × 256 GB USB/SSD via `export` (one kept off-site) | 265 GB on disks |
+| P1 | 1.26 TB | 2 | 2.51 TB |
+| P2 | 1.84 TB | 1 (+ a 2nd copy for the regional reserve) | 1.84 TB |
+| Manifest, lockfiles, cargo index, tools | < 1 GB | Every disk and drive, plus a printed MANIFEST.md | — |
+| **Total** | **3.23 TB** | | **4.62 TB of 20 TB (23%)** |
 
-Cycle 1 needs no new disks, only two cheap 256 GB drives for P0. The next purchase (a 3rd disk of 10–12 TB, total ≈ 30 TB raw) is decided in 2027-04 and enables a second copy of P2.
+Cycle 1 needs no new disks, only two 256 GB drives for P0. That leaves about 13 TB (after a 15% free-space margin) for P3, so the April 2027 review decides between:
+- **(a)** adding a second copy of P2 (+1.84 TB), or
+- **(b)** filling P3,
+
+and when the 3rd disk (toward 30 TB) is needed.
+
+**Download time at 1 Gbps** (~100 MB/s sustained): about 9 hours for P0+P1, about 5 more for P2. Debian, the crates and the elevation tiles are ~270k small files, so use `--workers 8`.
 
 ## 6. Six-month review procedure
 
 Run every April and October, and record the results in the change log.
 
-1. **Integrity:** run `verify` on every disk and drive; record SMART data, power-on hours and reallocated sectors. Replace any disk that shows errors.
-2. **Restore test:** on a clean offline machine, using P0 media only: open Kiwix, search Wikipedia, run the Level A model, and open one handbook PDF. Record the time taken and any failures.
-3. **Source refresh:** run `discover`, then diff the queue against the last manifest for new versions, dead URLs and size changes. Update every **e** in §2 to **m**.
+1. **Integrity:** `vault.py verify` on every disk and drive; record SMART data, power-on hours and reallocated sectors. Replace any disk that shows errors; `sync` restores the copies.
+2. **Restore test:** on a clean offline machine, using P0 media only: open Kiwix, search Wikipedia, run the Level A model with llama.cpp, and open one FAA handbook. Then, using P1:
+   - install one package from the Debian mirror
+   - install the `core` Python group with `--require-hashes`
+   - build one crate offline against the vault registry
+
+   Record the time taken and any failures.
+3. **Source refresh:** `discover` (all sources), then `plan --list`; diff against the previous queue (new versions, dead links, size changes). Fix any `FAIL` line in `sources.json`.
 4. **Model refresh:** benchmark candidates against the eval set and apply the refresh rule (§4). Check licenses.
-5. **Advanced-tech minimum:** confirm each row in §3 is present and readable; add whatever was deferred.
-6. **License/legal check** for any new source.
-7. **Budget decision:** additional disks, redundancy level for P2, and which P3 candidates to add.
-8. **Borrowed-GPU log:** what was run, outputs stored, and what comes next.
-9. Bump the plan version, add a change-log entry and set the next review date.
+5. **Software refresh:** decide whether to move to the next Debian stable / Python minor / CUDA release (a new release means a new, full download of that component).
+6. **Advanced-tech minimum:** confirm each row in §3 is present and readable; work through the manual items.
+7. **License/legal check** for any new source.
+8. **Budget decision:** disks, second copy of P2, and which P3 candidates to add.
+9. **Borrowed-GPU log:** what was run, outputs stored, and what comes next.
+10. Bump the plan version, add a change-log entry and set the next review date.
 
-## 7. Known issues in civilization_vault_v4 (fix before the next download run)
+## 7. Issues found in civilization_vault_v4 — status in v5
 
-Verified 2026-10-29 by running v4's own `kiwix_discover` against the live Kiwix catalog:
+| v4 defect | v5 |
+|---|---|
+| Kiwix downloads were 1.8 MB `.meta4` XML files saved as `.zim` | **Fixed:** real ZIM URL; SHA-256 taken from the metalink |
+| Language filter on `<title>` dropped English Wikipedia, Wikibooks, Gutenberg, Stack Overflow; queued French/Portuguese packs and ~100 TED packs | **Fixed:** explicit allowlist by catalog name + flavour |
+| Only 1,200 of 3,656 catalog entries read | **Fixed:** full catalog |
+| LLM discovery picked the smallest shard; no vision projector; no original weights | **Fixed:** shard completeness check; projector files and full repositories supported; pinned to commit |
+| Models a generation old | **Fixed:** Qwen3.8 / Qwen3.6 / Gemma 4 / DeepSeek-V4.1 / GLM-5.3 |
+| No per-tier copies; capacity mode checked only the primary disk; SQLite connection leak | **Fixed:** tier copy policy, `sync` / `export`, per-disk free-space checks, one connection per disk |
+| `sources.json` had 2 entries | **Fixed:** 142 sources (127 automated, 15 manual) |
 
-1. **Every Kiwix URL points to a `.zim.meta4` file.** The code downloads a ~1.8 MB metalink XML file and saves it as `.zim`. Fix: strip `.meta4` from the URL, read the SHA-256 from the metalink, and set `expected_bytes` from the OPDS `length`.
-2. **The language filter checks `<title>`, but the title is just "Wikipedia".** As a result, English Wikipedia, Wikibooks, Gutenberg and Stack Overflow are **never queued**, while French Khan Academy, French/Portuguese iFixit and hundreds of TED topic packs are. Fix: replace keyword matching with an explicit allowlist of `<name>` + `<flavour>` taken from §2.
-3. **`count=1200` reads only the first 1,200 of 3,656 catalog entries.**
-4. **LLM discovery picks the *smallest* matching GGUF file.** For split models this is one shard, which gives an unusable model. It also skips `mmproj` (needed for vision) and cannot fetch original safetensors weights (needed for Level C).
-5. **Model list is a generation old:** Qwen3 / Gemma 3. Replace with the models in §4.
-6. **Neither mode can do per-tier copies.** `copies` mode puts everything on both disks, and `capacity` mode puts everything on one. A tier-aware placement is needed (P0/P1 on both disks, P2 by free space). In `capacity` mode the loop also checks free space only on the primary disk, and opens a new SQLite connection for every secondary-disk file.
-7. **No sources yet for §3**, the Debian/OSM/DEM bulk sets, or the Wikipedia XML dump; `sources.json` has 2 entries.
+v5 also checks resumed downloads with `If-Range`, so a changed upstream file restarts instead of corrupting. It verifies every file against the publisher's hash where one exists, and `verify` marks bad copies so `sync` repairs them.
 
 ## Change log
 
-- **2026-10 (cycle 1):** Plan created. Sizes measured from the Kiwix OPDS catalog (3,656 entries), Hugging Face API, AWS S3 listings (Copernicus), the NCBI PubChem FTP listing, the GitHub API, and HEAD requests (OSM, Wikimedia dumps). v4 discovery defects documented (§7).
+- **2026-10 (cycle 1):** Plan created. Sizes measured from the Kiwix OPDS catalog (3,656 entries), Hugging Face API, AWS S3 listings (Copernicus), NCBI, the GitHub API, and HEAD checks. v4 defects documented.
+- **2026-10 (cycle 1, rev. 2):** v5 implemented and tested end to end on 2,137 real files (download, hash verification, sync, corruption repair, export). Added the full software stack (§2a): Debian 13 mirror with source, Python 3.13 wheelhouses (Linux CUDA + Windows) with source packages, Rust toolchains + crate registry, CUDA 12.8.1, Windows build tools, PyTorch source. Every tier re-measured: 3.23 TB logical / 4.62 TB raw (was ~8 TB estimated). Debian came out far smaller than estimated (243 GB vs ~1 TB) and moved from P2 to P1; Copernicus DEM tiles only (GLO-90 71 GB, GLO-30 589 GB).

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Civilization Vault v0.5: tiered, allowlist-driven, resumable acquisition across several disks.
-Python 3.10+; standard library only. Implements VAULT_PLAN.md (repository root).
-Sources are an explicit allowlist in sources.json; nothing is crawled or guessed.
+Python 3.11+; standard library only (pip is used by discover to resolve Python packages).
+Implements VAULT_PLAN.md (repository root). Sources are an explicit allowlist in sources.json.
 """
-import argparse, concurrent.futures as cf, datetime, hashlib, json, os, re, shutil, sqlite3, sys, threading, time
+import argparse, concurrent.futures as cf, datetime, hashlib, json, lzma, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -13,7 +13,8 @@ UA = f'CivilizationVault/{VERSION} (personal offline preservation archive)'
 CHUNK = 1024 * 1024
 META = '_metadata'
 DBNAME = 'vault5.sqlite3'
-TYPES = ('kiwix', 'hf', 'github_release', 'github_source', 'url', 'http_index', 's3', 'manual')
+TYPES = ('kiwix', 'hf', 'github_release', 'github_source', 'url', 'http_index', 's3', 'debian', 'pypi', 'rust_toolchain', 'crates', 'manual')
+EXACT_PART = re.compile(r'^[A-Za-z0-9._+~%@=-]+$')
 lock = threading.Lock()
 
 
@@ -45,8 +46,15 @@ def request(url, headers=None, timeout=60, method='GET'):
         if os.environ.get('GITHUB_TOKEN'): req.add_unredirected_header('Authorization', 'Bearer ' + os.environ['GITHUB_TOKEN'])
     return urllib.request.urlopen(req, timeout=timeout)
 
-def get_bytes(url, timeout=120):
-    with request(url, timeout=timeout) as r: return r.read()
+def get_bytes(url, timeout=120, tries=3):
+    for attempt in range(tries):
+        try:
+            with request(url, timeout=timeout) as r: return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == tries - 1: raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt == tries - 1: raise
+        time.sleep(5 * (attempt + 1))
 
 def get_text(url): return get_bytes(url).decode('utf8', 'replace')
 
@@ -62,17 +70,38 @@ def get_json_pages(url):
         url = m.group(1) if m else None
     return out
 
+def listing(url):
+    """Names linked from an HTML directory index -> absolute URLs; directories keep their trailing slash."""
+    out = {}
+    for href in re.findall(r'href="([^"]+)"', get_text(url), re.I):
+        path = href.split('?')[0]
+        name = urllib.parse.unquote(path.rstrip('/').rsplit('/', 1)[-1])
+        if name and name not in ('.', '..') and name not in out:
+            out[name + ('/' if path.endswith('/') else '')] = urllib.parse.urljoin(url, href)
+    return out
+
 
 # ---------- source resolution ----------
 
-def make_item(src, name, url, size=None, sha256=None, md5=None, title=None):
-    parts = [clean(p) for p in name.split('/') if p]
-    if not parts or any(p in ('.', '..') for p in parts): raise ValueError(f'unsafe file name {name!r}')
+GENERATED = []  # small files written by discover itself (lockfiles, cargo index), dicts of path/tier/text
+
+def make_item(src, name, url, size=None, sha256=None, md5=None, title=None, exact=False):
+    """exact=True keeps the upstream relative path byte for byte (needed for apt and cargo layouts)."""
+    raw = [p for p in name.split('/') if p]
+    if exact:
+        if not raw or any(p in ('.', '..') or not EXACT_PART.match(p) for p in raw): raise ValueError(f'unsafe file name {name!r}')
+        parts = raw
+    else:
+        parts = [clean(p) for p in raw]
+        if not parts: raise ValueError(f'unsafe file name {name!r}')
     sub = '/'.join(parts)
     return {'id': f"{src['id']}/{sub}", 'source': src['id'], 'tier': src['tier'], 'category': src['category'],
-            'path': f"{src['category']}/{clean(src['id'])}/{sub}", 'url': url, 'bytes': size,
+            'path': f"{src['category']}/{clean(src.get('dir', src['id']))}/{sub}", 'url': url, 'bytes': size,
             'sha256': sha256.lower() if sha256 else None, 'md5': md5.lower() if md5 else None,
             'title': title or src.get('title', src['id']), 'license': src.get('license', '')}
+
+def generate(src, name, text):
+    GENERATED.append({'path': f"{src['category']}/{clean(src.get('dir', src['id']))}/{name}", 'tier': src['tier'], 'source': src['id'], 'text': text})
 
 _cache = {}
 
@@ -186,11 +215,14 @@ def resolve_url(src):
 
 def resolve_http_index(src):
     index = src['index']
-    names = {}
-    for href in re.findall(r'href="([^"]+)"', get_text(index), re.I):
-        name = urllib.parse.unquote(href.split('?')[0].rstrip('/').rsplit('/', 1)[-1])
-        if name and re.search(src['match'], name) and name not in names:
-            names[name] = src['base'] + urllib.parse.quote(name) if src.get('base') else urllib.parse.urljoin(index, href)
+    if src.get('dir_match'):  # newest sub-directory that actually contains a matching file
+        dirs = sorted((n for n in listing(index) if n.endswith('/') and re.search(src['dir_match'], n[:-1])), key=natural, reverse=True)
+        for d in dirs:
+            sub = urllib.parse.urljoin(index, urllib.parse.quote(d))
+            if any(re.search(src['match'], n) for n in listing(sub)): index = sub; break
+        else: raise ValueError(f"no directory matching {src['dir_match']} contains {src['match']}")
+    names = {n: (src['base'] + urllib.parse.quote(n) if src.get('base') else u) for n, u in listing(index).items()
+             if not n.endswith('/') and re.search(src['match'], n)}
     if not names: raise ValueError(f"index has no file matching {src['match']}")
     chosen = sorted(names, key=natural)
     if src.get('pick') == 'latest':  # newest per family: names that differ only in their numbers are one family
@@ -204,8 +236,7 @@ def resolve_http_index(src):
             if m: sums[m.group(2).rsplit('/', 1)[-1]] = m.group(1)
     out = []
     for n in chosen:
-        h = sums.get(n)
-        url = names[n]
+        h, url = sums.get(n), names[n]
         if not is_https(url): raise ValueError(f'non-https file link {url}')
         out.append(make_item(src, n, url, sha256=h if h and len(h) == 64 else None, md5=h if h and len(h) == 32 else None))
     return out
@@ -230,8 +261,250 @@ def resolve_s3(src):
     if not out: raise ValueError(f"no S3 keys match {src['match']}")
     return out
 
+def resolve_debian(src):
+    """A usable apt mirror: signed Release files, the indices, and every .deb / source file they list (all SHA-256)."""
+    base = src['mirror'].rstrip('/') + '/'
+    code = re.search(r'^Codename: (\S+)', get_text(base + f"dists/{src['suite']}/Release"), re.M).group(1)
+    d = f'dists/{code}/'
+    release = get_text(base + d + 'Release')
+    sums = {}
+    for line in re.search(r'^SHA256:\n((?: .*\n?)+)', release, re.M).group(1).splitlines():
+        h, size, name = line.split()
+        sums[name] = (h, int(size))
+    out = [make_item(src, d + n, base + d + n, exact=True) for n in ('Release', 'InRelease', 'Release.gpg')]
+    def index(name):
+        h, size = sums[name]
+        out.append(make_item(src, d + name, base + d + name, size, sha256=h, exact=True))
+        data = get_bytes(base + d + name)
+        if hashlib.sha256(data).hexdigest() != h: raise ValueError(f'{name} does not match the Release file')
+        return lzma.decompress(data).decode('utf8', 'replace')
+    for comp in src['components']:
+        for arch in src.get('architectures', []):
+            for stanza in index(f'{comp}/binary-{arch}/Packages.xz').split('\n\n'):
+                f = dict(re.findall(r'^(Filename|Size|SHA256): (\S+)', stanza, re.M))
+                if f: out.append(make_item(src, f['Filename'], base + f['Filename'], int(f['Size']), sha256=f['SHA256'], exact=True))
+        if src.get('source'):
+            for stanza in index(f'{comp}/source/Sources.xz').split('\n\n'):
+                dm = re.search(r'^Directory: (\S+)', stanza, re.M)
+                block = re.search(r'^Checksums-Sha256:\n((?: .*\n?)+)', stanza + '\n', re.M)
+                if not dm or not block: continue
+                for line in block.group(1).splitlines():
+                    h, size, name = line.split()
+                    p = f'{dm.group(1)}/{name}'
+                    out.append(make_item(src, p, base + p, int(size), sha256=h, exact=True))
+        for n in sums:  # the small per-component Release files apt reads alongside the indices
+            if n.startswith(comp + '/') and n.endswith('/Release') and (any(f'binary-{a}/' in n for a in src.get('architectures', [])) or (src.get('source') and '/source/' in n)):
+                out.append(make_item(src, d + n, base + d + n, sums[n][1], sha256=sums[n][0], exact=True))
+    seen, dedup = set(), []
+    for it in out:  # architecture "all" packages appear in every architecture's index
+        if it['path'] not in seen: seen.add(it['path']); dedup.append(it)
+    generate(src, f'README-{src["id"]}.txt',
+             f"Debian {code} mirror ({', '.join(src['components'])}; {', '.join(src.get('architectures', []))}{'; source' if src.get('source') else ''}).\n"
+             f"Use it offline with this line in /etc/apt/sources.list (adjust the path):\n"
+             f"  deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] file:/media/vault/{src['category']}/{clean(src.get('dir', src['id']))} {code} {' '.join(src['components'])}\n"
+             f"and for sources add the same line starting with deb-src.\n")
+    return dedup
+
+def pypi_release(name, version):
+    key = f'pypi:{name}=={version}'
+    if key not in _cache: _cache[key] = get_json(f'https://pypi.org/pypi/{urllib.parse.quote(name)}/{urllib.parse.quote(version)}/json')
+    return _cache[key]
+
+def resolve_pypi(src):
+    """pip resolves the complete dependency set for the target platform; nothing is installed here.
+    "groups" maps a name to a requirement list; each group is resolved on its own (one consistent environment,
+    one hash-locked requirements file), so packages that pin conflicting versions do not make pip backtrack forever."""
+    groups = src.get('groups') or {'all': src['requirements']}
+    with cf.ThreadPoolExecutor(4) as pool:
+        results = list(pool.map(lambda g: pypi_group(src, g, groups[g]), groups))
+    out = [it for items in results for it in items]
+    for name in src.get('sdist_only', []):
+        info = get_json(f'https://pypi.org/pypi/{urllib.parse.quote(name)}/json')
+        s = next((u for u in info['urls'] if u['packagetype'] == 'sdist'), None)
+        if not s: raise ValueError(f'{name} has no source distribution on PyPI')
+        out.append(make_item(src, 'sdists/' + s['filename'], s['url'], s['size'], sha256=s['digests']['sha256'], title=f"{name} {info['info']['version']} source"))
+    seen, dedup = set(), []
+    for it in out:  # groups share many packages
+        if it['path'] not in seen: seen.add(it['path']); dedup.append(it)
+    return dedup
+
+def pypi_group(src, group, requirements):
+    with tempfile.TemporaryDirectory() as td:
+        req, rep = Path(td) / 'requirements.txt', Path(td) / 'report.json'
+        req.write_text('\n'.join(requirements) + '\n', encoding='utf8')
+        cmd = [sys.executable, '-m', 'pip', 'install', '--dry-run', '--ignore-installed', '--quiet', '--disable-pip-version-check',
+               '--report', str(rep), '--python-version', src['python'], '--implementation', 'cp', '--only-binary=:all:', '-r', str(req)]
+        for p in src['platforms']: cmd += ['--platform', p]
+        for u in src.get('extra_index_urls', []): cmd += ['--extra-index-url', u]
+        try: r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf8', errors='replace', timeout=src.get('timeout_min', 15) * 60)
+        except subprocess.TimeoutExpired:
+            raise ValueError(f'group {group!r}: pip kept backtracking past the time limit; some requirements pin incompatible versions, split the group') from None
+        if r.returncode:
+            raise ValueError(f'group {group!r}: pip could not resolve: ' + ' | '.join(l for l in r.stderr.strip().splitlines() if 'ERROR' in l)[:600])
+        report = json.loads(rep.read_text(encoding='utf8'))
+    out, pins = [], []
+    def files(name, version, url=None):
+        try: return pypi_release(name, version)['urls']
+        except urllib.error.HTTPError: return []  # e.g. a package served by an extra index
+    for x in report['install']:
+        name, ver, url = x['metadata']['name'], x['metadata']['version'], x['download_info']['url']
+        meta = files(name, ver)
+        f = next((u for u in meta if u['url'] == url), None)
+        sha = (x['download_info'].get('archive_info', {}).get('hashes') or {}).get('sha256') or (f and f['digests']['sha256'])
+        out.append(make_item(src, 'wheels/' + urllib.parse.unquote(url.rsplit('/', 1)[-1]), url, f and f['size'], sha256=sha, title=f'{name} {ver}'))
+        pins.append(f'{name}=={ver} --hash=sha256:{sha}')
+        if src.get('sdists'):
+            s = next((u for u in meta if u['packagetype'] == 'sdist'), None)
+            if s: out.append(make_item(src, 'sdists/' + s['filename'], s['url'], s['size'], sha256=s['digests']['sha256'], title=f'{name} {ver} source'))
+    lock_name = f"requirements-{src['id']}-{group}.txt"
+    generate(src, lock_name,
+             f"# Group {group!r}: {', '.join(requirements)}\n"
+             f"# Resolved {now()} for Python {src['python']} on {', '.join(src['platforms'])}. Install into its own virtual environment:\n"
+             f"#   pip install --no-index --find-links wheels --require-hashes -r {lock_name}\n"
+             + '\n'.join(sorted(pins, key=str.lower)) + '\n')
+    return out
+
+def resolve_rust_toolchain(src):
+    import tomllib
+    channel = src.get('channel', 'stable')
+    m = tomllib.loads(get_text(f'https://static.rust-lang.org/dist/channel-rust-{channel}.toml'))
+    ver = m['pkg']['rust']['version'].split()[0]
+    out = []
+    for pkg, targets in src['packages'].items():
+        for t in targets:
+            e = m['pkg'][pkg]['target'].get(t) or {}
+            if not e.get('available'): raise ValueError(f'{pkg} is not available for {t} in Rust {ver}')
+            out.append(make_item(src, e['xz_url'].rsplit('/', 1)[-1], e['xz_url'], sha256=e['xz_hash'], title=f'Rust {ver} {pkg} {t}'))
+    for t in src.get('msi', []):
+        url = f'https://static.rust-lang.org/dist/rust-{ver}-{t}.msi'
+        out.append(make_item(src, url.rsplit('/', 1)[-1], url, sha256=get_text(url + '.sha256').split()[0], title=f'Rust {ver} installer {t}'))
+    if src.get('source'):
+        url = f'https://static.rust-lang.org/dist/rustc-{ver}-src.tar.xz'
+        out.append(make_item(src, url.rsplit('/', 1)[-1], url, sha256=get_text(url + '.sha256').split()[0], title=f'Rust {ver} compiler source'))
+    return out
+
+# Cargo semver requirements: ^ (default), ~, =, >, >=, <, <=, wildcards; comma means "and".
+def parse_ver(s):
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?$', s)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) or '') if m else None
+
+def ver_key(v): return (v[0], v[1], v[2], v[3] == '', natural(v[3]))
+
+def req_bounds(req):
+    lo, hi, exact = [], [], []  # lists of (version tuple, inclusive)
+    for part in [p.strip() for p in req.split(',') if p.strip()]:
+        m = re.match(r'^(\^|~|=|>=|<=|>|<)?\s*v?(\*|\d+)(?:\.(\*|\d+))?(?:\.(\*|\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+\S*)?$', part)
+        if not m: raise ValueError(f'unparsed version requirement {req!r}')
+        op, nums = m.group(1) or '^', [None if g in (None, '*') else int(g) for g in m.groups()[1:4]]
+        if nums[0] is None: continue
+        maj, mi, pa = nums
+        base = (maj, mi or 0, pa or 0)
+        if op == '>=': lo.append((base, True)); continue
+        if op == '>': lo.append((base, False)); continue
+        if op == '<=': hi.append((base, True)); continue
+        if op == '<': hi.append((base, False)); continue
+        if op == '=' and pa is not None: exact.append(base); continue
+        lo.append((base, True))
+        if op == '^' and pa is not None and mi is not None:
+            up = (maj + 1, 0, 0) if maj else (0, mi + 1, 0) if mi else (0, 0, pa + 1)
+        elif op == '^' and mi is not None: up = (maj + 1, 0, 0) if maj else (0, mi + 1, 0)
+        elif mi is not None: up = (maj, mi + 1, 0)  # ~x.y, =x.y, x.y.*
+        else: up = (maj + 1, 0, 0)
+        hi.append((up, False))
+    return lo, hi, exact
+
+def satisfies(v, bounds):
+    lo, hi, exact = bounds
+    t = v[:3]
+    return (all(t > b or (inc and t == b) for b, inc in lo) and all(t < b or (inc and t == b) for b, inc in hi)
+            and all(t == e for e in exact))
+
+def crate_index_path(name):
+    n = name.lower()
+    return f'1/{n}' if len(n) == 1 else f'2/{n}' if len(n) == 2 else f'3/{n[0]}/{n}' if len(n) == 3 else f'{n[:2]}/{n[2:4]}/{n}'
+
+def enabled_deps(line, feats, default):
+    """Cargo feature resolution for one crate version: which dependencies are active and which features each gets."""
+    table = {**line.get('features', {}), **line.get('features2', {})}
+    deps = [d for d in line.get('deps', []) if d.get('kind') != 'dev']
+    optional = {d['name'] for d in deps if d.get('optional')}
+    explicit = {v[4:] for vals in table.values() for v in vals if v.startswith('dep:')}
+    on, extra, weak, seen = set(), {}, [], set()
+    todo = list(feats) + (['default'] if default and 'default' in table else [])
+    while todo:
+        f = todo.pop()
+        if f in seen: continue
+        seen.add(f)
+        if f in table:
+            for v in table[f]:
+                if v.startswith('dep:'): on.add(v[4:])
+                elif '?/' in v: weak.append(v.split('?/', 1))
+                elif '/' in v:
+                    dep, feat = v.split('/', 1)
+                    if dep in optional: on.add(dep)
+                    extra.setdefault(dep, set()).add(feat)
+                else: todo.append(v)
+        elif f in optional and f not in explicit: on.add(f)  # an optional dependency is also an implicit feature
+    for dep, feat in weak:
+        if dep in on or dep not in optional: extra.setdefault(dep, set()).add(feat)
+    return [(d, set(d.get('features', [])) | extra.get(d['name'], set())) for d in deps if not d.get('optional') or d['name'] in on]
+
+def resolve_crates(src):
+    """Dependency closure of the seed crates from the crates.io sparse index, stored as a cargo local-registry.
+    Seeds are names with optional features, e.g. "tokio[full]"; default features are always on for seeds."""
+    index, chosen, missing = {}, {}, set()
+    todo = []
+    for s in src['seeds']:
+        m = re.match(r'^([A-Za-z0-9_-]+)(?:\[([^\]]*)\])?$', s)
+        if not m: raise ValueError(f'bad seed {s!r}')
+        todo.append((m.group(1), '*', False, {f.strip() for f in (m.group(2) or '').split(',') if f.strip()}, True))
+    def fetch(n):
+        try: return n, [json.loads(l) for l in get_text('https://index.crates.io/' + crate_index_path(n)).splitlines() if l.strip()]
+        except urllib.error.HTTPError as e:
+            if e.code == 404: return n, []
+            raise
+    state = {}  # (name, version) -> [index line, features enabled so far, default features on]
+    rounds = 0
+    while todo:
+        need = {t[0].lower() for t in todo if t[0].lower() not in index}
+        with cf.ThreadPoolExecutor(16) as pool:
+            for n, lines in pool.map(fetch, sorted(need)): index[n] = lines
+        nxt = []
+        for name, req, pre_ok, feats, default in todo:
+            bounds = req_bounds(req)
+            cands = [(parse_ver(l['vers']), l) for l in index[name.lower()] if not l.get('yanked')]
+            cands = [(v, l) for v, l in cands if v and (pre_ok or not v[3]) and satisfies(v, bounds)]
+            if not cands: missing.add(f'{name} {req}'); continue
+            line = max(cands, key=lambda x: ver_key(x[0]))[1]
+            key = (line['name'], line['vers'])
+            st = state.get(key)
+            if st and feats <= st[1] and (st[2] or not default): continue  # nothing new is enabled
+            if st: st[1] |= feats; st[2] = st[2] or default
+            else: st = state[key] = [line, set(feats), default]
+            for dep, dep_feats in enabled_deps(line, st[1], st[2]):
+                nxt.append((dep.get('package') or dep['name'], dep['req'], '-' in dep['req'], dep_feats, dep.get('default_features', True)))
+        todo, rounds = nxt, rounds + 1
+        if rounds % 5 == 0: print(f"  {src['id']}: {len(state)} crate versions so far", flush=True)
+    if missing: print(f"  {src['id']}: {len(missing)} requirement(s) had no matching version, e.g. {sorted(missing)[:3]}", flush=True)
+    chosen = {k: v[0] for k, v in state.items()}
+    out, by_name = [], {}
+    for (name, vers), line in sorted(chosen.items()):
+        out.append(make_item(src, f'cargo_registry/{name}-{vers}.crate', f'https://static.crates.io/crates/{name}/{name}-{vers}.crate',
+                             sha256=line['cksum'], title=f'crate {name} {vers}'))
+        by_name.setdefault(name.lower(), []).append(json.dumps(line, separators=(',', ':')))
+    for name, lines in by_name.items():
+        generate(src, 'cargo_registry/index/' + crate_index_path(name), '\n'.join(lines) + '\n')
+    generate(src, 'cargo-config.toml',
+             f"# {len(chosen)} crate versions resolved {now()} from seeds: {', '.join(src['seeds'])}\n"
+             "# Copy into ~/.cargo/config.toml (fix the path) to build offline; delete a project's Cargo.lock\n"
+             "# or run `cargo generate-lockfile --offline` if it pins versions that are not in the vault.\n"
+             "[source.crates-io]\nreplace-with = \"vault\"\n\n[source.vault]\n"
+             f"local-registry = \"/media/vault/{src['category']}/{clean(src.get('dir', src['id']))}/cargo_registry\"\n\n[net]\noffline = true\n")
+    return out
+
 RESOLVERS = {'kiwix': resolve_kiwix, 'hf': resolve_hf, 'github_release': resolve_github_release, 'github_source': resolve_github_source,
-             'url': resolve_url, 'http_index': resolve_http_index, 's3': resolve_s3}
+             'url': resolve_url, 'http_index': resolve_http_index, 's3': resolve_s3, 'debian': resolve_debian, 'pypi': resolve_pypi,
+             'rust_toolchain': resolve_rust_toolchain, 'crates': resolve_crates}
 
 def load_sources():
     cfg = json.loads((HERE / 'sources.json').read_text(encoding='utf8'))
@@ -273,6 +546,7 @@ class Disk:
         self.con.execute('PRAGMA journal_mode=WAL')
         self.con.execute('CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, source TEXT, tier INTEGER, relative_path TEXT, url TEXT, bytes INTEGER, sha256 TEXT, status TEXT, updated TEXT, note TEXT)')
         self.con.commit()
+        self._done = None
 
     def __repr__(self): return str(self.root)
     def free(self): return shutil.disk_usage(self.root).free
@@ -281,18 +555,30 @@ class Disk:
     def get(self, iid):
         with lock: return self.con.execute('SELECT bytes, sha256, status FROM files WHERE id=?', (iid,)).fetchone()
 
-    def has(self, iid):
-        row = self.get(iid)
-        return bool(row and row[2] == 'done')
+    def done_ids(self):
+        if self._done is None:
+            with lock: self._done = {r[0] for r in self.con.execute('SELECT id FROM files WHERE status=?', ('done',))}
+        return self._done
+
+    def has(self, iid): return iid in self.done_ids()
 
     def put(self, it, size, digest, status, note=''):
         with lock:
             self.con.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?,?)',
                              (it['id'], it['source'], it['tier'], it['path'], it['url'], size, digest, status, now(), note))
             self.con.commit()
+            if self._done is not None: (self._done.add if status == 'done' else self._done.discard)(it['id'])
+
+    def record(self, iid):
+        with lock: return self.con.execute('SELECT relative_path, bytes, sha256 FROM files WHERE id=? AND status=?', (iid, 'done')).fetchone()
 
     def rows(self, status='done'):
         with lock: return self.con.execute('SELECT id, relative_path, bytes, sha256 FROM files WHERE status=?', (status,)).fetchall()
+
+    def mark(self, iid, status, note):
+        with lock:
+            self.con.execute('UPDATE files SET status=?, updated=?, note=? WHERE id=?', (status, now(), note, iid)); self.con.commit()
+            if self._done is not None and status != 'done': self._done.discard(iid)
 
 def open_disks(paths, allow_same=False):
     if not paths: raise SystemExit('Give at least one --disk')
@@ -318,13 +604,17 @@ def copy_tools(root):
     for f in (HERE / 'vault.py', HERE / 'sources.json', HERE / 'README.md', HERE.parent / 'VAULT_PLAN.md'):
         if f.exists(): shutil.copy2(f, dst / f.name)
 
-def hash_file(path, md5=False):
-    h, m = hashlib.sha256(), hashlib.md5() if md5 else None
+def write_generated(q, root, max_tier=99):
+    for g in q.get('generated', []):
+        if g['tier'] <= max_tier:
+            p = root / g['path']; p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(g['text'], encoding='utf8')
+
+def hash_file(path):
+    h = hashlib.sha256()
     with path.open('rb') as f:
-        for b in iter(lambda: f.read(4 * CHUNK), b''):
-            h.update(b)
-            if m: m.update(b)
-    return h.hexdigest(), m.hexdigest() if m else None
+        for b in iter(lambda: f.read(4 * CHUNK), b''): h.update(b)
+    return h.hexdigest()
 
 
 # ---------- download ----------
@@ -356,7 +646,7 @@ def download(it, disk, deadline, reserve, maxfile, retries, stop):
                 if start and status == 200: start = 0
                 elif start and status != 206: raise RuntimeError(f'unexpected resume status {status}')
                 if status == 206 and not r.headers.get('Content-Range', '').startswith(f'bytes {start}-'): raise RuntimeError('invalid Content-Range')
-                if 'text/html' in r.headers.get('Content-Type', '').lower() and not dst.suffix.lower() in ('.html', '.htm'):
+                if 'text/html' in r.headers.get('Content-Type', '').lower() and dst.suffix.lower() not in ('.html', '.htm'):
                     raise RuntimeError('server returned an HTML page instead of the file')
                 length = r.headers.get('Content-Length')
                 remaining = int(length) if length and length.isdigit() else None
@@ -385,8 +675,7 @@ def download(it, disk, deadline, reserve, maxfile, retries, stop):
                         amount += len(b)
             if remaining is not None and amount - start != remaining: raise IOError('incomplete transfer')
             digest = h.hexdigest()
-            bad = (it.get('sha256') and digest != it['sha256']) or (m and m.hexdigest() != it['md5'])
-            if bad:
+            if (it.get('sha256') and digest != it['sha256']) or (m and m.hexdigest() != it['md5']):
                 part.unlink(missing_ok=True); side.unlink(missing_ok=True)
                 raise IOError('checksum mismatch against the published hash; partial file discarded')
             os.replace(part, dst); side.unlink(missing_ok=True)
@@ -424,29 +713,29 @@ def copy_verified(src_disk, dst_disk, it, rel, nbytes, digest):
     dst_disk.put(it, nbytes, digest, 'done', f'copied from {src_disk}')
     return None
 
-def record_of(disk, iid):
-    with lock: return disk.con.execute('SELECT relative_path, bytes, sha256 FROM files WHERE id=? AND status=?', (iid, 'done')).fetchone()
-
 def write_manifest(q, disks, dest_root=None):
-    held = {it['id']: [str(d.root) for d in disks if d.has(it['id'])] for it in q['items']}
+    held = {it['id']: [d for d in disks if d.has(it['id'])] for it in q['items']}
     roots = [Path(dest_root)] if dest_root else [d.root for d in disks]
     for root in roots:
         lines = ['tier\tid\ttitle\tbytes\tsha256\tlicense\tpath\tcopies\turl']
-        md = [f'# Civilization Vault manifest', '', f'Generated {now()} by vault.py {VERSION}. Plan: `_tools/VAULT_PLAN.md`. '
-              'Check any file with `py -3 _tools/vault.py --disk <this drive> verify`.', '']
+        md = ['# Civilization Vault manifest', '', f'Generated {now()} by vault.py {VERSION}. Plan: `_tools/VAULT_PLAN.md`. '
+              'Check files with `py -3 _tools/vault.py --disk <this drive> verify`.', '']
         for tier in sorted(q['tiers'], key=int):
             items = [it for it in q['items'] if str(it['tier']) == tier]
             have = [it for it in items if held[it['id']]]
             md += [f"## P{tier}: {q['tiers'][tier].get('label', '')}", '',
-                   f"{len(have)}/{len(items)} files present, {sizefmt(sum(it['bytes'] or 0 for it in have))}", '',
-                   '| Category | Title | File | Size | SHA-256 (first 16) | Copies |', '|---|---|---|---|---|---|']
+                   f"{len(have)}/{len(items)} files present, {sizefmt(sum(it['bytes'] or 0 for it in have))}", '']
+            groups = {}
             for it in items:
-                rec = next((record_of(d, it['id']) for d in disks if d.has(it['id'])), None)
-                sha = (rec[2] if rec else it.get('sha256')) or ''
+                sha = it.get('sha256') or ''
+                if held[it['id']] and not sha: sha = (held[it['id']][0].record(it['id']) or ('', 0, ''))[2]
                 lines.append('\t'.join(str(x) for x in (tier, it['id'], it['title'], it['bytes'] or '', sha, it.get('license', ''), it['path'], len(held[it['id']]), it['url'])))
-                if held[it['id']]:
-                    md.append(f"| {it['category']} | {it['title']} | `{it['path']}` | {sizefmt(it['bytes'])} | `{sha[:16]}` | {len(held[it['id']])} |")
+                g = groups.setdefault(it['source'], [it['category'], it['source'], 0, 0, 0, set()])
+                g[2] += 1; g[3] += bool(held[it['id']]); g[4] += it['bytes'] or 0; g[5].add(len(held[it['id']]))
+            md += ['| Category | Source | Files present | Size | Copies |', '|---|---|---|---|---|']
+            md += [f"| {c} | {t} | {h}/{n} | {sizefmt(b)} | {'-'.join(str(x) for x in sorted(cp))} |" for c, t, n, h, b, cp in groups.values()]
             md.append('')
+        md += ['Every file, with its SHA-256 and origin URL, is listed in MANIFEST.tsv.', '']
         if q.get('manual'):
             md += ['## Manual acquisitions (not downloadable by this tool)', '']
             md += [f"- **P{m['tier']} {m['id']}**: {m.get('title', '')}. {m.get('instructions', '')}" for m in q['manual']]
@@ -476,31 +765,33 @@ def cmd_discover(args, disks):
                   + (f", {sum(1 for i in got if not i['bytes'])} of unknown size" if any(not i['bytes'] for i in got) else ''), flush=True)
         except Exception as e:
             errors[src['id']] = str(e); print(f"FAIL  P{src['tier']} {src['id']}: {e}", file=sys.stderr, flush=True)
+    generated = list(GENERATED)
     if prev:  # partial refresh: keep previously resolved items of the sources not refreshed
-        keep = [it for it in prev['items'] if not only.search(it['source'])]
-        items = keep + items
-        errors = {**{k: v for k, v in prev.get('errors', {}).items() if not only.search(k)}, **errors}
+        items = [it for it in prev['items'] if not only.search(it['source'])] + items
+        generated = [g for g in prev.get('generated', []) if not only.search(g['source'])] + generated
+        errors = {**{k: v for k, v in prev.get('errors', {}).items() if not only.search(k.split('/')[0])}, **errors}
     if not args.no_probe:
         targets = [it for it in items if it['bytes'] is None and not it['url'].startswith('https://codeload.github.com/')]
         if targets: print(f'Checking {len(targets)} links without a published size...', flush=True)
         with cf.ThreadPoolExecutor(8) as pool:
             for it, err in zip(targets, pool.map(probe, targets)):
                 if err: errors[it['id']] = f'link check failed: {err}'; print(f"FAIL  {it['id']}: {err}", file=sys.stderr)
-    ids, dedup = set(), []
+    paths, dedup = set(), []
     for it in sorted(items, key=lambda x: (x['tier'], x['order'], natural(x['path']))):
-        if it['id'] not in ids: ids.add(it['id']); dedup.append(it)
-    q = {'generated': now(), 'version': VERSION, 'sources_version': cfg.get('version'), 'tiers': cfg['tiers'],
-         'items': dedup, 'manual': manual, 'errors': errors}
+        if it['path'] not in paths: paths.add(it['path']); dedup.append(it)  # shared directories: keep the lowest tier
+    q = {'generated_at': now(), 'version': VERSION, 'sources_version': cfg.get('version'), 'tiers': cfg['tiers'],
+         'items': dedup, 'generated': generated, 'manual': manual, 'errors': errors}
     for d in disks:
-        queue_path(d).write_text(json.dumps(q, indent=1), encoding='utf8')
+        queue_path(d).write_text(json.dumps(q, indent=0), encoding='utf8')
         copy_tools(d.root)
+        write_generated(q, d.root)
     print_plan(q, disks, 3)
     if errors: print(f'\n{len(errors)} problem(s), see above. Failed sources are left out of the queue until fixed; '
                      'files whose link check failed stay queued and are retried by run.')
 
 def print_plan(q, disks, max_tier):
     n = len(disks)
-    print(f"\nQueue generated {q['generated']} (sources {q.get('sources_version')}), {len(disks)} disk(s)")
+    print(f"\nQueue generated {q['generated_at']} (sources {q.get('sources_version')}), {n} disk(s)")
     print(f"{'Tier':<6}{'Files':>8}{'Logical':>13}{'Unknown':>9}{'Copies':>8}{'Raw needed':>13}{'Still to write':>16}")
     total_raw = total_left = 0
     for tier in sorted(q['tiers'], key=int):
@@ -521,12 +812,15 @@ def cmd_plan(args, disks):
     q = load_queue(disks)
     print_plan(q, disks, args.max_tier)
     if args.list:
+        sizes = {}
         for it in q['items']:
-            if it['tier'] <= args.max_tier: print(f"[P{it['tier']}] {sizefmt(it['bytes']):>10}  {it['id']}")
+            if it['tier'] <= args.max_tier:
+                s = sizes.setdefault((it['tier'], it['source']), [0, 0]); s[0] += 1; s[1] += it['bytes'] or 0
+        for (tier, src), (n, b) in sorted(sizes.items()): print(f'[P{tier}] {sizefmt(b):>10} {n:>7} file(s)  {src}')
 
 def cmd_run(args, disks):
     q = load_queue(disks)
-    if not 1 <= args.workers <= 8: raise SystemExit('Use 1 to 8 workers')
+    if not 1 <= args.workers <= 16: raise SystemExit('Use 1 to 16 workers')
     if args.reserve_gb < 50: print(f'WARNING: --reserve-gb {args.reserve_gb} is below the 50 GB recommended for large disks')
     reserve, maxfile = int(args.reserve_gb * 1e9), int(args.max_file_gb * 1e9)
     only = re.compile(args.only) if args.only else None
@@ -558,7 +852,7 @@ def cmd_run(args, disks):
                     inflight[d.root] -= it.get('bytes') or 0
                     status, note = f.result()
                     counts[status] = counts.get(status, 0) + 1
-                    print(f"{status:7s} P{it['tier']} {it['id']} -> {d}: {note}", flush=True)
+                    if status != 'DONE' or not args.quiet: print(f"{status:7s} P{it['tier']} {it['id']} -> {d}: {note}", flush=True)
     except KeyboardInterrupt:
         stop.set(); print('Interrupted; partial downloads are kept and resume on the next run.')
     print('Summary:', ', '.join(f'{k} {v}' for k, v in sorted(counts.items())) or 'nothing to do')
@@ -574,7 +868,7 @@ def cmd_sync(args, disks):
             need = copies_for(q, it['tier'], len(disks))
             have = [d for d in disks if d.has(it['id'])]
             if not have or len(have) >= need: continue
-            rel, nbytes, digest = record_of(have[0], it['id'])
+            rel, nbytes, digest = have[0].record(it['id'])
             while len(have) < need:
                 room = [d for d in disks if d not in have and d.free() >= nbytes + reserve]
                 if not room:
@@ -583,7 +877,7 @@ def cmd_sync(args, disks):
                 err = copy_verified(have[0], target, it, rel, nbytes, digest)
                 if err: print(f"ERROR   {it['id']}: {err}"); break
                 have.append(target); made += 1
-                print(f"COPIED  P{it['tier']} {it['id']} -> {target} ({sizefmt(nbytes)})", flush=True)
+                if not args.quiet: print(f"COPIED  P{it['tier']} {it['id']} -> {target} ({sizefmt(nbytes)})", flush=True)
     except KeyboardInterrupt:
         print('Interrupted; rerun sync to continue.')
     print(f'Sync: {made} copies made, {short} files short of space.')
@@ -596,11 +890,10 @@ def cmd_verify(args, disks):
         print(f'Verifying {len(rows)} file(s) on {d}' + (' (sizes only)' if args.quick else ''), flush=True)
         for iid, rel, nbytes, digest in rows:
             p = d.root / rel
-            ok = p.is_file() and p.stat().st_size == nbytes and (args.quick or hash_file(p)[0] == digest)
+            ok = p.is_file() and p.stat().st_size == nbytes and (args.quick or hash_file(p) == digest)
             if not ok:
                 failed += 1
-                with lock:
-                    d.con.execute('UPDATE files SET status=?, updated=?, note=? WHERE id=?', ('corrupt', now(), 'failed verify', iid)); d.con.commit()
+                d.mark(iid, 'corrupt', 'failed verify')
                 print(f'FAIL {d}: {rel} (marked corrupt; sync restores it from another copy, run re-downloads it otherwise)')
     print(f'Verify finished: {failed} failure(s).')
     try: write_manifest(load_queue(disks), disks)
@@ -616,39 +909,43 @@ def cmd_export(args, disks):
         if it['tier'] > args.max_tier or dest.has(it['id']): continue
         src = next((d for d in disks if d.has(it['id'])), None)
         if not src: print(f"MISSING {it['id']} (not downloaded yet)"); continue
-        rel, nbytes, digest = record_of(src, it['id'])
+        rel, nbytes, digest = src.record(it['id'])
         if dest.free() < nbytes + int(args.reserve_gb * 1e9): print(f"NO SPACE on {dest} for {it['id']}"); continue
         err = copy_verified(src, dest, it, rel, nbytes, digest)
         print(f"ERROR   {it['id']}: {err}" if err else f"EXPORTED P{it['tier']} {it['id']} ({sizefmt(nbytes)})", flush=True)
         made += 0 if err else 1
-    queue_path(dest).write_text(json.dumps(q, indent=1), encoding='utf8')
+    sub = dict(q, items=[it for it in q['items'] if it['tier'] <= args.max_tier], generated=[g for g in q.get('generated', []) if g['tier'] <= args.max_tier])
+    queue_path(dest).write_text(json.dumps(sub, indent=0), encoding='utf8')
     copy_tools(dest.root)
-    write_manifest(q, disks + [dest], dest.root)
+    write_generated(sub, dest.root)
+    write_manifest(sub, disks + [dest], dest.root)
     print(f'Export: {made} file(s) copied to {dest}; MANIFEST.md and _tools/ written there.')
 
 def cmd_status(args, disks):
     q = load_queue(disks)
     n = len(disks)
-    print(f"Queue {q['generated']} | sources {q.get('sources_version')} | {n} disk(s)")
-    print(f"{'Tier':<6}{'Files':>7}{'Complete':>10}{'Short':>7}{'Missing':>9}{'Stored':>13}  Copies")
+    print(f"Queue {q['generated_at']} | sources {q.get('sources_version')} | {n} disk(s)")
+    print(f"{'Tier':<6}{'Files':>8}{'Complete':>10}{'Short':>7}{'Missing':>9}{'Stored':>13}  Copies")
     for tier in sorted(q['tiers'], key=int):
         items = [it for it in q['items'] if str(it['tier']) == tier]
         need = copies_for(q, tier, n)
         held = [sum(d.has(it['id']) for d in disks) for it in items]
         stored = sum(it['bytes'] or 0 for it, h in zip(items, held) if h)
-        print(f"P{tier:<5}{len(items):>7}{sum(h >= need for h in held):>10}{sum(0 < h < need for h in held):>7}{sum(h == 0 for h in held):>9}{sizefmt(stored):>13}  {need} ({q['tiers'][tier].get('label', '')})")
+        print(f"P{tier:<5}{len(items):>8}{sum(h >= need for h in held):>10}{sum(0 < h < need for h in held):>7}{sum(h == 0 for h in held):>9}{sizefmt(stored):>13}  {need} ({q['tiers'][tier].get('label', '')})")
     for d in disks:
-        print(f"  {d}: {len(d.rows())} verified files, {len(d.rows('corrupt'))} corrupt, {sizefmt(d.free())} free of {sizefmt(d.total())}")
+        print(f"  {d}: {len(d.done_ids())} verified files, {len(d.rows('corrupt'))} corrupt, {sizefmt(d.free())} free of {sizefmt(d.total())}")
     if q.get('errors'):
-        print(f"\n{len(q['errors'])} discovery error(s):")
+        print(f"\n{len(q['errors'])} discovery problem(s):")
         for k, v in q['errors'].items(): print(f'  {k}: {v}')
     if q.get('manual'):
         print('\nManual acquisitions:')
         for m in q['manual']: print(f"  P{m['tier']} {m['id']}: {m.get('title', '')}")
 
 def cmd_manifest(args, disks):
-    write_manifest(load_queue(disks), disks)
-    print('MANIFEST.md and MANIFEST.tsv written to every disk.')
+    q = load_queue(disks)
+    for d in disks: write_generated(q, d.root)
+    write_manifest(q, disks)
+    print('MANIFEST.md, MANIFEST.tsv and generated files written to every disk.')
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -659,20 +956,22 @@ if __name__ == '__main__':
     sp.add_argument('--sources', help='Regex: refresh only matching source ids, keep the rest of the existing queue')
     sp.add_argument('--no-probe', action='store_true', help='Skip HEAD checks of links without a published size')
     sp = sub.add_parser('plan', help='Sizes per tier against disk capacity')
-    sp.add_argument('--max-tier', type=int, default=3); sp.add_argument('--list', action='store_true')
+    sp.add_argument('--max-tier', type=int, default=3); sp.add_argument('--list', action='store_true', help='Size of every source')
     sp = sub.add_parser('run', help='Download queued files (one copy each)')
-    sp.add_argument('--hours', type=float, default=48); sp.add_argument('--workers', type=int, default=2)
+    sp.add_argument('--hours', type=float, default=48); sp.add_argument('--workers', type=int, default=4)
     sp.add_argument('--max-tier', type=int, default=2); sp.add_argument('--reserve-gb', type=float, default=750)
     sp.add_argument('--max-file-gb', type=float, default=350); sp.add_argument('--retries', type=int, default=3)
     sp.add_argument('--only', help='Regex on item ids, e.g. for a test download')
+    sp.add_argument('--quiet', action='store_true', help='Print only problems, not every finished file')
     sp = sub.add_parser('sync', help='Make the extra verified copies each tier requires')
     sp.add_argument('--max-tier', type=int, default=3); sp.add_argument('--reserve-gb', type=float, default=750)
+    sp.add_argument('--quiet', action='store_true')
     sp = sub.add_parser('verify', help='Re-hash every recorded file on every disk')
     sp.add_argument('--quick', action='store_true', help='Check sizes only')
     sp = sub.add_parser('export', help='Copy tiers up to --max-tier to a small offline drive')
     sp.add_argument('--dest', required=True); sp.add_argument('--max-tier', type=int, default=0); sp.add_argument('--reserve-gb', type=float, default=1)
     sub.add_parser('status', help='Completeness per tier, copies, errors and manual items')
-    sub.add_parser('manifest', help='Rewrite MANIFEST.md / MANIFEST.tsv on every disk')
+    sub.add_parser('manifest', help='Rewrite MANIFEST.md / MANIFEST.tsv and generated files on every disk')
     a = p.parse_args()
     ds = open_disks(a.disk, a.allow_same_device)
     {'discover': cmd_discover, 'plan': cmd_plan, 'run': cmd_run, 'sync': cmd_sync, 'verify': cmd_verify,
