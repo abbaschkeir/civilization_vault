@@ -1,0 +1,5 @@
+[
+  {"id":"qwen3_8b_q4","repo":"Qwen/Qwen3-8B-GGUF","pattern":"Q4_K_M","priority":0,"purpose":"Offline general assistant, low resource"},
+  {"id":"qwen3_32b_q4","repo":"Qwen/Qwen3-32B-GGUF","pattern":"Q4_K_M","priority":0,"purpose":"Advanced reasoning and coding; 19.8 GB weights"},
+  {"id":"gemma3_27b_q4","repo":"ggml-org/gemma-3-27b-it-GGUF","pattern":"Q4_K_M","priority":1,"purpose":"Independent multimodal model family; license review required"}
+]

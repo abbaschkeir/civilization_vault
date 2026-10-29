@@ -1,0 +1,4 @@
+[
+ {"id":"gutenberg_catalog","priority":0,"category":"01_EDUCATION","filename":"gutenberg_catalog.csv","title":"Project Gutenberg catalog metadata","url":"https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv","origin":"Gutenberg catalog only"},
+ {"id":"kiwix_library_metadata","priority":0,"category":"_references","filename":"kiwix_opds_root.xml","title":"Kiwix OPDS catalog documentation/feed","url":"https://opds.library.kiwix.org/catalog/v2/root.xml","origin":"Kiwix official OPDS"}
+]
